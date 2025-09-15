@@ -1,8 +1,9 @@
 package dns
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 import (
+	"context"
+
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
@@ -17,16 +18,12 @@ type ResolvableContext struct {
 
 // GetTargetIPs overrides original routing.Context's implementation.
 func (ctx *ResolvableContext) GetTargetIPs() []net.IP {
-	if ips := ctx.Context.GetTargetIPs(); len(ips) != 0 {
-		return ips
-	}
-
 	if len(ctx.resolvedIPs) > 0 {
 		return ctx.resolvedIPs
 	}
 
 	if domain := ctx.GetTargetDomain(); len(domain) != 0 {
-		ips, err := ctx.dnsClient.LookupIP(domain, dns.IPOption{
+		ips, _, err := ctx.dnsClient.LookupIP(domain, dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -35,7 +32,11 @@ func (ctx *ResolvableContext) GetTargetIPs() []net.IP {
 			ctx.resolvedIPs = ips
 			return ips
 		}
-		newError("resolve ip for ", domain).Base(err).WriteToLog()
+		errors.LogInfoInner(context.Background(), err, "resolve ip for ", domain)
+	}
+
+	if ips := ctx.Context.GetTargetIPs(); len(ips) != 0 {
+		return ips
 	}
 
 	return nil

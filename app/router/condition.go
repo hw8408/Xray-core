@@ -1,11 +1,10 @@
 package router
 
 import (
+	"regexp"
 	"strings"
 
-	"go.starlark.net/starlark"
-	"go.starlark.net/syntax"
-
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/strmatcher"
 	"github.com/xtls/xray-core/features/routing"
@@ -51,12 +50,12 @@ var matcherTypeMap = map[Domain_Type]strmatcher.Type{
 func domainToMatcher(domain *Domain) (strmatcher.Matcher, error) {
 	matcherType, f := matcherTypeMap[domain.Type]
 	if !f {
-		return nil, newError("unsupported domain type", domain.Type)
+		return nil, errors.New("unsupported domain type", domain.Type)
 	}
 
 	matcher, err := matcherType.New(domain.Value)
 	if err != nil {
-		return nil, newError("failed to create domain matcher").Base(err)
+		return nil, errors.New("failed to create domain matcher").Base(err)
 	}
 
 	return matcher, nil
@@ -71,7 +70,7 @@ func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
 	for _, d := range domains {
 		matcherType, f := matcherTypeMap[d.Type]
 		if !f {
-			return nil, newError("unsupported domain type", d.Type)
+			return nil, errors.New("unsupported domain type", d.Type)
 		}
 		_, err := g.AddPattern(d.Value, matcherType)
 		if err != nil {
@@ -79,21 +78,6 @@ func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
 		}
 	}
 	g.Build()
-	return &DomainMatcher{
-		matchers: g,
-	}, nil
-}
-
-func NewDomainMatcher(domains []*Domain) (*DomainMatcher, error) {
-	g := new(strmatcher.MatcherGroup)
-	for _, d := range domains {
-		m, err := domainToMatcher(d)
-		if err != nil {
-			return nil, err
-		}
-		g.Add(m)
-	}
-
 	return &DomainMatcher{
 		matchers: g,
 	}, nil
@@ -114,13 +98,13 @@ func (m *DomainMatcher) Apply(ctx routing.Context) bool {
 
 type MultiGeoIPMatcher struct {
 	matchers []*GeoIPMatcher
-	onSource bool
+	asType   string // local, source, target
 }
 
-func NewMultiGeoIPMatcher(geoips []*GeoIP, onSource bool) (*MultiGeoIPMatcher, error) {
+func NewMultiGeoIPMatcher(geoips []*GeoIP, asType string) (*MultiGeoIPMatcher, error) {
 	var matchers []*GeoIPMatcher
 	for _, geoip := range geoips {
-		matcher, err := globalGeoIPContainer.Add(geoip)
+		matcher, err := GlobalGeoIPContainer.Add(geoip)
 		if err != nil {
 			return nil, err
 		}
@@ -129,7 +113,7 @@ func NewMultiGeoIPMatcher(geoips []*GeoIP, onSource bool) (*MultiGeoIPMatcher, e
 
 	matcher := &MultiGeoIPMatcher{
 		matchers: matchers,
-		onSource: onSource,
+		asType:   asType,
 	}
 
 	return matcher, nil
@@ -138,11 +122,18 @@ func NewMultiGeoIPMatcher(geoips []*GeoIP, onSource bool) (*MultiGeoIPMatcher, e
 // Apply implements Condition.
 func (m *MultiGeoIPMatcher) Apply(ctx routing.Context) bool {
 	var ips []net.IP
-	if m.onSource {
+
+	switch m.asType {
+	case "local":
+		ips = ctx.GetLocalIPs()
+	case "source":
 		ips = ctx.GetSourceIPs()
-	} else {
+	case "target":
 		ips = ctx.GetTargetIPs()
+	default:
+		panic("unreachable, asType should be local or source or target")
 	}
+
 	for _, ip := range ips {
 		for _, matcher := range m.matchers {
 			if matcher.Match(ip) {
@@ -154,25 +145,33 @@ func (m *MultiGeoIPMatcher) Apply(ctx routing.Context) bool {
 }
 
 type PortMatcher struct {
-	port     net.MemoryPortList
-	onSource bool
+	port   net.MemoryPortList
+	asType string // local, source, target
 }
 
-// NewPortMatcher create a new port matcher that can match source or destination port
-func NewPortMatcher(list *net.PortList, onSource bool) *PortMatcher {
+// NewPortMatcher create a new port matcher that can match source or local or destination port
+func NewPortMatcher(list *net.PortList, asType string) *PortMatcher {
 	return &PortMatcher{
-		port:     net.PortListFromProto(list),
-		onSource: onSource,
+		port:   net.PortListFromProto(list),
+		asType: asType,
 	}
 }
 
 // Apply implements Condition.
 func (v *PortMatcher) Apply(ctx routing.Context) bool {
-	if v.onSource {
+	switch v.asType {
+	case "local":
+		return v.port.Contains(ctx.GetLocalPort())
+	case "source":
 		return v.port.Contains(ctx.GetSourcePort())
-	} else {
+	case "target":
 		return v.port.Contains(ctx.GetTargetPort())
+	case "vlessRoute":
+		return v.port.Contains(ctx.GetVlessRoute())
+	default:
+		panic("unreachable, asType should be local or source or target")
 	}
+
 }
 
 type NetworkMatcher struct {
@@ -193,18 +192,28 @@ func (v NetworkMatcher) Apply(ctx routing.Context) bool {
 }
 
 type UserMatcher struct {
-	user []string
+	user    []string
+	pattern []*regexp.Regexp
 }
 
 func NewUserMatcher(users []string) *UserMatcher {
 	usersCopy := make([]string, 0, len(users))
+	patternsCopy := make([]*regexp.Regexp, 0, len(users))
 	for _, user := range users {
 		if len(user) > 0 {
+			if len(user) > 7 && strings.HasPrefix(user, "regexp:") {
+				if re, err := regexp.Compile(user[7:]); err == nil {
+					patternsCopy = append(patternsCopy, re)
+				}
+				// Items of users slice with an invalid regexp syntax are ignored.
+				continue
+			}
 			usersCopy = append(usersCopy, user)
 		}
 	}
 	return &UserMatcher{
-		user: usersCopy,
+		user:    usersCopy,
+		pattern: patternsCopy,
 	}
 }
 
@@ -216,6 +225,11 @@ func (v *UserMatcher) Apply(ctx routing.Context) bool {
 	}
 	for _, u := range v.user {
 		if u == user {
+			return true
+		}
+	}
+	for _, re := range v.pattern {
+		if re.MatchString(user) {
 			return true
 		}
 	}
@@ -285,44 +299,22 @@ func (m *ProtocolMatcher) Apply(ctx routing.Context) bool {
 }
 
 type AttributeMatcher struct {
-	program *starlark.Program
-}
-
-func NewAttributeMatcher(code string) (*AttributeMatcher, error) {
-	starFile, err := syntax.Parse("attr.star", "satisfied=("+code+")", 0)
-	if err != nil {
-		return nil, newError("attr rule").Base(err)
-	}
-	p, err := starlark.FileProgram(starFile, func(name string) bool {
-		return name == "attrs"
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &AttributeMatcher{
-		program: p,
-	}, nil
+	configuredKeys map[string]*regexp.Regexp
 }
 
 // Match implements attributes matching.
 func (m *AttributeMatcher) Match(attrs map[string]string) bool {
-	attrsDict := new(starlark.Dict)
+	// header keys are case insensitive most likely. So we do a convert
+	httpHeaders := make(map[string]string)
 	for key, value := range attrs {
-		attrsDict.SetKey(starlark.String(key), starlark.String(value))
+		httpHeaders[strings.ToLower(key)] = value
 	}
-
-	predefined := make(starlark.StringDict)
-	predefined["attrs"] = attrsDict
-
-	thread := &starlark.Thread{
-		Name: "matcher",
+	for key, regex := range m.configuredKeys {
+		if a, ok := httpHeaders[key]; !ok || !regex.MatchString(a) {
+			return false
+		}
 	}
-	results, err := m.program.Init(thread, predefined)
-	if err != nil {
-		newError("attr matcher").Base(err).WriteToLog()
-	}
-	satisfied := results["satisfied"]
-	return satisfied != nil && bool(satisfied.Truth())
+	return true
 }
 
 // Apply implements Condition.

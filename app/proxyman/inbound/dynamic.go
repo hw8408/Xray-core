@@ -7,12 +7,15 @@ import (
 
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common/dice"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 type DynamicInboundHandler struct {
@@ -22,7 +25,7 @@ type DynamicInboundHandler struct {
 	receiverConfig *proxyman.ReceiverConfig
 	streamSettings *internet.MemoryStreamConfig
 	portMutex      sync.Mutex
-	portsInUse     map[net.Port]bool
+	portsInUse     map[net.Port]struct{}
 	workerMutex    sync.RWMutex
 	worker         []worker
 	lastRefresh    time.Time
@@ -38,7 +41,7 @@ func NewDynamicInboundHandler(ctx context.Context, tag string, receiverConfig *p
 		tag:            tag,
 		proxyConfig:    proxyConfig,
 		receiverConfig: receiverConfig,
-		portsInUse:     make(map[net.Port]bool),
+		portsInUse:     make(map[net.Port]struct{}),
 		mux:            mux.NewServer(ctx),
 		v:              v,
 		ctx:            ctx,
@@ -46,7 +49,7 @@ func NewDynamicInboundHandler(ctx context.Context, tag string, receiverConfig *p
 
 	mss, err := internet.ToMemoryStreamConfig(receiverConfig.StreamSettings)
 	if err != nil {
-		return nil, newError("failed to parse stream settings").Base(err).AtWarning()
+		return nil, errors.New("failed to parse stream settings").Base(err).AtWarning()
 	}
 	if receiverConfig.ReceiveOriginalDestination {
 		if mss.SocketSettings == nil {
@@ -69,18 +72,21 @@ func NewDynamicInboundHandler(ctx context.Context, tag string, receiverConfig *p
 }
 
 func (h *DynamicInboundHandler) allocatePort() net.Port {
-	from := int(h.receiverConfig.PortRange.From)
-	delta := int(h.receiverConfig.PortRange.To) - from + 1
-
+	allPorts := []int32{}
+	for _, pr := range h.receiverConfig.PortList.Range {
+		for i := pr.From; i <= pr.To; i++ {
+			allPorts = append(allPorts, int32(i))
+		}
+	}
 	h.portMutex.Lock()
 	defer h.portMutex.Unlock()
 
 	for {
-		r := dice.Roll(delta)
-		port := net.Port(from + r)
+		r := dice.Roll(len(allPorts))
+		port := net.Port(allPorts[r])
 		_, used := h.portsInUse[port]
 		if !used {
-			h.portsInUse[port] = true
+			h.portsInUse[port] = struct{}{}
 			return port
 		}
 	}
@@ -91,7 +97,7 @@ func (h *DynamicInboundHandler) closeWorkers(workers []worker) {
 	for idx, worker := range workers {
 		ports2Del[idx] = worker.Port()
 		if err := worker.Close(); err != nil {
-			newError("failed to close worker").Base(err).WriteToLog()
+			errors.LogInfoInner(h.ctx, err, "failed to close worker")
 		}
 	}
 
@@ -120,7 +126,7 @@ func (h *DynamicInboundHandler) refresh() error {
 		port := h.allocatePort()
 		rawProxy, err := core.CreateObject(h.v, h.proxyConfig)
 		if err != nil {
-			newError("failed to create proxy instance").Base(err).AtWarning().WriteToLog()
+			errors.LogWarningInner(h.ctx, err, "failed to create proxy instance")
 			continue
 		}
 		p := rawProxy.(proxy.Inbound)
@@ -140,7 +146,7 @@ func (h *DynamicInboundHandler) refresh() error {
 				ctx:             h.ctx,
 			}
 			if err := worker.Start(); err != nil {
-				newError("failed to create TCP worker").Base(err).AtWarning().WriteToLog()
+				errors.LogWarningInner(h.ctx, err, "failed to create TCP worker")
 				continue
 			}
 			workers = append(workers, worker)
@@ -160,7 +166,7 @@ func (h *DynamicInboundHandler) refresh() error {
 				ctx:             h.ctx,
 			}
 			if err := worker.Start(); err != nil {
-				newError("failed to create UDP worker").Base(err).AtWarning().WriteToLog()
+				errors.LogWarningInner(h.ctx, err, "failed to create UDP worker")
 				continue
 			}
 			workers = append(workers, worker)
@@ -200,4 +206,17 @@ func (h *DynamicInboundHandler) GetRandomInboundProxy() (interface{}, net.Port, 
 
 func (h *DynamicInboundHandler) Tag() string {
 	return h.tag
+}
+
+// ReceiverSettings implements inbound.Handler.
+func (h *DynamicInboundHandler) ReceiverSettings() *serial.TypedMessage {
+	return serial.ToTypedMessage(h.receiverConfig)
+}
+
+// ProxySettings implements inbound.Handler.
+func (h *DynamicInboundHandler) ProxySettings() *serial.TypedMessage {
+	if v, ok := h.proxyConfig.(proto.Message); ok {
+		return serial.ToTypedMessage(v)
+	}
+	return nil
 }

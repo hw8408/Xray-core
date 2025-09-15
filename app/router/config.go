@@ -1,52 +1,18 @@
 package router
 
 import (
-	"github.com/xtls/xray-core/common/net"
+	"context"
+	"regexp"
+	"strings"
+
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 )
 
-// CIDRList is an alias of []*CIDR to provide sort.Interface.
-type CIDRList []*CIDR
-
-// Len implements sort.Interface.
-func (l *CIDRList) Len() int {
-	return len(*l)
-}
-
-// Less implements sort.Interface.
-func (l *CIDRList) Less(i int, j int) bool {
-	ci := (*l)[i]
-	cj := (*l)[j]
-
-	if len(ci.Ip) < len(cj.Ip) {
-		return true
-	}
-
-	if len(ci.Ip) > len(cj.Ip) {
-		return false
-	}
-
-	for k := 0; k < len(ci.Ip); k++ {
-		if ci.Ip[k] < cj.Ip[k] {
-			return true
-		}
-
-		if ci.Ip[k] > cj.Ip[k] {
-			return false
-		}
-	}
-
-	return ci.Prefix < cj.Prefix
-}
-
-// Swap implements sort.Interface.
-func (l *CIDRList) Swap(i int, j int) {
-	(*l)[i], (*l)[j] = (*l)[j], (*l)[i]
-}
-
 type Rule struct {
 	Tag       string
+	RuleTag   string
 	Balancer  *Balancer
 	Condition Condition
 }
@@ -67,28 +33,20 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	conds := NewConditionChan()
 
 	if len(rr.Domain) > 0 {
-		switch rr.DomainMatcher {
-		case "linear":
-			matcher, err := NewDomainMatcher(rr.Domain)
-			if err != nil {
-				return nil, newError("failed to build domain condition").Base(err)
-			}
-			conds.Add(matcher)
-		case "mph", "hybrid":
-			fallthrough
-		default:
-			matcher, err := NewMphMatcherGroup(rr.Domain)
-			if err != nil {
-				return nil, newError("failed to build domain condition with MphDomainMatcher").Base(err)
-			}
-			newError("MphDomainMatcher is enabled for ", len(rr.Domain), " domain rule(s)").AtDebug().WriteToLog()
-			conds.Add(matcher)
+		matcher, err := NewMphMatcherGroup(rr.Domain)
+		if err != nil {
+			return nil, errors.New("failed to build domain condition with MphDomainMatcher").Base(err)
 		}
-
+		errors.LogDebug(context.Background(), "MphDomainMatcher is enabled for ", len(rr.Domain), " domain rule(s)")
+		conds.Add(matcher)
 	}
 
 	if len(rr.UserEmail) > 0 {
 		conds.Add(NewUserMatcher(rr.UserEmail))
+	}
+
+	if rr.VlessRouteList != nil {
+		conds.Add(NewPortMatcher(rr.VlessRouteList, "vlessRoute"))
 	}
 
 	if len(rr.InboundTag) > 0 {
@@ -96,29 +54,23 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	}
 
 	if rr.PortList != nil {
-		conds.Add(NewPortMatcher(rr.PortList, false))
-	} else if rr.PortRange != nil {
-		conds.Add(NewPortMatcher(&net.PortList{Range: []*net.PortRange{rr.PortRange}}, false))
+		conds.Add(NewPortMatcher(rr.PortList, "target"))
 	}
 
 	if rr.SourcePortList != nil {
-		conds.Add(NewPortMatcher(rr.SourcePortList, true))
+		conds.Add(NewPortMatcher(rr.SourcePortList, "source"))
+	}
+
+	if rr.LocalPortList != nil {
+		conds.Add(NewPortMatcher(rr.LocalPortList, "local"))
 	}
 
 	if len(rr.Networks) > 0 {
 		conds.Add(NewNetworkMatcher(rr.Networks))
-	} else if rr.NetworkList != nil {
-		conds.Add(NewNetworkMatcher(rr.NetworkList.Network))
 	}
 
 	if len(rr.Geoip) > 0 {
-		cond, err := NewMultiGeoIPMatcher(rr.Geoip, false)
-		if err != nil {
-			return nil, err
-		}
-		conds.Add(cond)
-	} else if len(rr.Cidr) > 0 {
-		cond, err := NewMultiGeoIPMatcher([]*GeoIP{{Cidr: rr.Cidr}}, false)
+		cond, err := NewMultiGeoIPMatcher(rr.Geoip, "target")
 		if err != nil {
 			return nil, err
 		}
@@ -126,17 +78,20 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	}
 
 	if len(rr.SourceGeoip) > 0 {
-		cond, err := NewMultiGeoIPMatcher(rr.SourceGeoip, true)
+		cond, err := NewMultiGeoIPMatcher(rr.SourceGeoip, "source")
 		if err != nil {
 			return nil, err
 		}
 		conds.Add(cond)
-	} else if len(rr.SourceCidr) > 0 {
-		cond, err := NewMultiGeoIPMatcher([]*GeoIP{{Cidr: rr.SourceCidr}}, true)
+	}
+
+	if len(rr.LocalGeoip) > 0 {
+		cond, err := NewMultiGeoIPMatcher(rr.LocalGeoip, "local")
 		if err != nil {
 			return nil, err
 		}
 		conds.Add(cond)
+		errors.LogWarning(context.Background(), "Due to some limitations, in UDP connections, localIP is always equal to listen interface IP, so \"localIP\" rule condition does not work properly on UDP inbound connections that listen on all interfaces")
 	}
 
 	if len(rr.Protocol) > 0 {
@@ -144,24 +99,63 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	}
 
 	if len(rr.Attributes) > 0 {
-		cond, err := NewAttributeMatcher(rr.Attributes)
-		if err != nil {
-			return nil, err
+		configuredKeys := make(map[string]*regexp.Regexp)
+		for key, value := range rr.Attributes {
+			configuredKeys[strings.ToLower(key)] = regexp.MustCompile(value)
 		}
-		conds.Add(cond)
+		conds.Add(&AttributeMatcher{configuredKeys})
 	}
 
 	if conds.Len() == 0 {
-		return nil, newError("this rule has no effective fields").AtWarning()
+		return nil, errors.New("this rule has no effective fields").AtWarning()
 	}
 
 	return conds, nil
 }
 
-func (br *BalancingRule) Build(ohm outbound.Manager) (*Balancer, error) {
-	return &Balancer{
-		selectors: br.OutboundSelector,
-		strategy:  &RandomStrategy{},
-		ohm:       ohm,
-	}, nil
+// Build builds the balancing rule
+func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatcher) (*Balancer, error) {
+	switch strings.ToLower(br.Strategy) {
+	case "leastping":
+		return &Balancer{
+			selectors:   br.OutboundSelector,
+			strategy:    &LeastPingStrategy{},
+			fallbackTag: br.FallbackTag,
+			ohm:         ohm,
+		}, nil
+	case "roundrobin":
+		return &Balancer{
+			selectors:   br.OutboundSelector,
+			strategy:    &RoundRobinStrategy{FallbackTag: br.FallbackTag},
+			fallbackTag: br.FallbackTag,
+			ohm:         ohm,
+		}, nil
+	case "leastload":
+		i, err := br.StrategySettings.GetInstance()
+		if err != nil {
+			return nil, err
+		}
+		s, ok := i.(*StrategyLeastLoadConfig)
+		if !ok {
+			return nil, errors.New("not a StrategyLeastLoadConfig").AtError()
+		}
+		leastLoadStrategy := NewLeastLoadStrategy(s)
+		return &Balancer{
+			selectors:   br.OutboundSelector,
+			ohm:         ohm,
+			fallbackTag: br.FallbackTag,
+			strategy:    leastLoadStrategy,
+		}, nil
+	case "random":
+		fallthrough
+	case "":
+		return &Balancer{
+			selectors:   br.OutboundSelector,
+			ohm:         ohm,
+			fallbackTag: br.FallbackTag,
+			strategy:    &RandomStrategy{FallbackTag: br.FallbackTag},
+		}, nil
+	default:
+		return nil, errors.New("unrecognized balancer type")
+	}
 }

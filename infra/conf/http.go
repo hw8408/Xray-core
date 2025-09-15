@@ -3,11 +3,11 @@ package conf
 import (
 	"encoding/json"
 
-	"github.com/golang/protobuf/proto"
-
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/proxy/http"
+	"google.golang.org/protobuf/proto"
 )
 
 type HTTPAccount struct {
@@ -23,7 +23,6 @@ func (v *HTTPAccount) Build() *http.Account {
 }
 
 type HTTPServerConfig struct {
-	Timeout     uint32         `json:"timeout"`
 	Accounts    []*HTTPAccount `json:"accounts"`
 	Transparent bool           `json:"allowTransparent"`
 	UserLevel   uint32         `json:"userLevel"`
@@ -31,7 +30,6 @@ type HTTPServerConfig struct {
 
 func (c *HTTPServerConfig) Build() (proto.Message, error) {
 	config := &http.ServerConfig{
-		Timeout:          c.Timeout,
 		AllowTransparent: c.Transparent,
 		UserLevel:        c.UserLevel,
 	}
@@ -51,12 +49,29 @@ type HTTPRemoteConfig struct {
 	Port    uint16            `json:"port"`
 	Users   []json.RawMessage `json:"users"`
 }
+
 type HTTPClientConfig struct {
-	Servers []*HTTPRemoteConfig `json:"servers"`
+	Address  *Address          	 `json:"address"`
+	Port     uint16            	 `json:"port"`
+	Level    uint32              `json:"level"`
+	Email    string              `json:"email"`
+	Username string              `json:"user"`
+	Password string              `json:"pass"`
+	Servers  []*HTTPRemoteConfig `json:"servers"`
+	Headers  map[string]string   `json:"headers"`
 }
 
 func (v *HTTPClientConfig) Build() (proto.Message, error) {
 	config := new(http.ClientConfig)
+	if v.Address != nil {
+		v.Servers = []*HTTPRemoteConfig{
+			{
+				Address: v.Address,
+				Port:    v.Port,
+				Users:   []json.RawMessage{{}},
+			},
+		}
+	}
 	config.Server = make([]*protocol.ServerEndpoint, len(v.Servers))
 	for idx, serverConfig := range v.Servers {
 		server := &protocol.ServerEndpoint{
@@ -65,17 +80,34 @@ func (v *HTTPClientConfig) Build() (proto.Message, error) {
 		}
 		for _, rawUser := range serverConfig.Users {
 			user := new(protocol.User)
-			if err := json.Unmarshal(rawUser, user); err != nil {
-				return nil, newError("failed to parse HTTP user").Base(err).AtError()
+			if v.Address != nil {
+				user.Level = v.Level
+				user.Email = v.Email
+			} else {
+				if err := json.Unmarshal(rawUser, user); err != nil {
+					return nil, errors.New("failed to parse HTTP user").Base(err).AtError()
+				}
 			}
 			account := new(HTTPAccount)
-			if err := json.Unmarshal(rawUser, account); err != nil {
-				return nil, newError("failed to parse HTTP account").Base(err).AtError()
+			if v.Address != nil {
+				account.Username = v.Username
+				account.Password = v.Password
+			} else {
+				if err := json.Unmarshal(rawUser, account); err != nil {
+					return nil, errors.New("failed to parse HTTP account").Base(err).AtError()
+				}
 			}
 			user.Account = serial.ToTypedMessage(account.Build())
 			server.User = append(server.User, user)
 		}
 		config.Server[idx] = server
+	}
+	config.Header = make([]*http.Header, 0, 32)
+	for key, value := range v.Headers {
+		config.Header = append(config.Header, &http.Header{
+			Key:   key,
+			Value: value,
+		})
 	}
 	return config, nil
 }

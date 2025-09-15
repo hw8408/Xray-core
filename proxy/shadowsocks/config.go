@@ -2,28 +2,33 @@ package shadowsocks
 
 import (
 	"bytes"
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/sha1"
+	"google.golang.org/protobuf/proto"
 	"io"
-	"reflect"
-	"strconv"
-
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/hkdf"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/antireplay"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 )
 
 // MemoryAccount is an account type converted from Account.
 type MemoryAccount struct {
-	Cipher Cipher
-	Key    []byte
+	Cipher     Cipher
+	CipherType CipherType
+	Key        []byte
+	Password   string
+
+	replayFilter antireplay.GeneralizedReplayFilter
 }
+
+var ErrIVNotUnique = errors.New("IV is not unique")
 
 // Equals implements protocol.Account.Equals().
 func (a *MemoryAccount) Equals(another protocol.Account) bool {
@@ -33,35 +38,38 @@ func (a *MemoryAccount) Equals(another protocol.Account) bool {
 	return false
 }
 
-func (a *MemoryAccount) GetCipherName() string {
-	switch a.Cipher.(type) {
-	case *AEADCipher:
-		switch reflect.ValueOf(a.Cipher.(*AEADCipher).AEADAuthCreator).Pointer() {
-		case reflect.ValueOf(createAesGcm).Pointer():
-			keyBytes := a.Cipher.(*AEADCipher).KeyBytes
-			return "AES_" + strconv.FormatInt(int64(keyBytes*8), 10) + "_GCM"
-		case reflect.ValueOf(createChaCha20Poly1305).Pointer():
-			return "CHACHA20_POLY1305"
-		}
-	case *NoneCipher:
-		return "NONE"
+func (a *MemoryAccount) ToProto() proto.Message {
+	return &Account{
+		CipherType: a.CipherType,
+		Password:   a.Password,
+		IvCheck:    a.replayFilter != nil,
 	}
+}
 
-	return ""
+func (a *MemoryAccount) CheckIV(iv []byte) error {
+	if a.replayFilter == nil {
+		return nil
+	}
+	if a.replayFilter.Check(iv) {
+		return nil
+	}
+	return ErrIVNotUnique
 }
 
 func createAesGcm(key []byte) cipher.AEAD {
-	block, err := aes.NewCipher(key)
-	common.Must(err)
-	gcm, err := cipher.NewGCM(block)
-	common.Must(err)
-	return gcm
+	return crypto.NewAesGcm(key)
 }
 
 func createChaCha20Poly1305(key []byte) cipher.AEAD {
 	ChaChaPoly1305, err := chacha20poly1305.New(key)
 	common.Must(err)
 	return ChaChaPoly1305
+}
+
+func createXChaCha20Poly1305(key []byte) cipher.AEAD {
+	XChaChaPoly1305, err := chacha20poly1305.NewX(key)
+	common.Must(err)
+	return XChaChaPoly1305
 }
 
 func (a *Account) getCipher() (Cipher, error) {
@@ -84,10 +92,16 @@ func (a *Account) getCipher() (Cipher, error) {
 			IVBytes:         32,
 			AEADAuthCreator: createChaCha20Poly1305,
 		}, nil
+	case CipherType_XCHACHA20_POLY1305:
+		return &AEADCipher{
+			KeyBytes:        32,
+			IVBytes:         32,
+			AEADAuthCreator: createXChaCha20Poly1305,
+		}, nil
 	case CipherType_NONE:
 		return NoneCipher{}, nil
 	default:
-		return nil, newError("Unsupported cipher.")
+		return nil, errors.New("Unsupported cipher.")
 	}
 }
 
@@ -95,11 +109,19 @@ func (a *Account) getCipher() (Cipher, error) {
 func (a *Account) AsAccount() (protocol.Account, error) {
 	Cipher, err := a.getCipher()
 	if err != nil {
-		return nil, newError("failed to get cipher").Base(err)
+		return nil, errors.New("failed to get cipher").Base(err)
 	}
 	return &MemoryAccount{
-		Cipher: Cipher,
-		Key:    passwordToCipherKey([]byte(a.Password), Cipher.KeySize()),
+		Cipher:     Cipher,
+		CipherType: a.CipherType,
+		Key:        passwordToCipherKey([]byte(a.Password), Cipher.KeySize()),
+		Password:   a.Password,
+		replayFilter: func() antireplay.GeneralizedReplayFilter {
+			if a.IvCheck {
+				return antireplay.NewBloomRing()
+			}
+			return nil
+		}(),
 	}, nil
 }
 
@@ -133,11 +155,12 @@ func (c *AEADCipher) IVSize() int32 {
 }
 
 func (c *AEADCipher) createAuthenticator(key []byte, iv []byte) *crypto.AEADAuthenticator {
-	nonce := crypto.GenerateInitialAEADNonce()
 	subkey := make([]byte, c.KeyBytes)
 	hkdfSHA1(key, iv, subkey)
+	aead := c.AEADAuthCreator(subkey)
+	nonce := crypto.GenerateAEADNonceWithSize(aead.NonceSize())
 	return &crypto.AEADAuthenticator{
-		AEAD:           c.AEADAuthCreator(subkey),
+		AEAD:           aead,
 		NonceGenerator: nonce,
 	}
 }
@@ -168,7 +191,7 @@ func (c *AEADCipher) EncodePacket(key []byte, b *buf.Buffer) error {
 
 func (c *AEADCipher) DecodePacket(key []byte, b *buf.Buffer) error {
 	if b.Len() <= c.IVSize() {
-		return newError("insufficient data: ", b.Len())
+		return errors.New("insufficient data: ", b.Len())
 	}
 	ivLen := c.IVSize()
 	payloadLen := b.Len()

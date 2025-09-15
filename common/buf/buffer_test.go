@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-
 	"github.com/xtls/xray-core/common"
 	. "github.com/xtls/xray-core/common/buf"
 )
@@ -78,6 +77,7 @@ func TestBufferByte(t *testing.T) {
 		buffer.Release()
 	}
 }
+
 func TestBufferResize(t *testing.T) {
 	buffer := New()
 	defer buffer.Release()

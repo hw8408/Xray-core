@@ -36,12 +36,23 @@ type pipe struct {
 	readSignal  *signal.Notifier
 	writeSignal *signal.Notifier
 	done        *done.Instance
+	errChan     chan error
 	option      pipeOption
 	state       state
 }
 
-var errBufferFull = errors.New("buffer full")
-var errSlowDown = errors.New("slow down")
+var (
+	errBufferFull = errors.New("buffer full")
+	errSlowDown   = errors.New("slow down")
+)
+
+func (p *pipe) Len() int32 {
+	data := p.data
+	if data == nil {
+		return 0
+	}
+	return data.Len()
+}
 
 func (p *pipe) getState(forRead bool) error {
 	switch p.state {
@@ -89,6 +100,8 @@ func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		select {
 		case <-p.readSignal.Wait():
 		case <-p.done.Wait():
+		case err = <-p.errChan:
+			return nil, err
 		}
 	}
 }
@@ -187,16 +200,19 @@ func (p *pipe) Interrupt() {
 	p.Lock()
 	defer p.Unlock()
 
+	if !p.data.IsEmpty() {
+		buf.ReleaseMulti(p.data)
+		p.data = nil
+		if p.state == closed {
+			p.state = errord
+		}
+	}
+
 	if p.state == closed || p.state == errord {
 		return
 	}
 
 	p.state = errord
-
-	if !p.data.IsEmpty() {
-		buf.ReleaseMulti(p.data)
-		p.data = nil
-	}
 
 	common.Must(p.done.Close())
 }

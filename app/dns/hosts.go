@@ -1,10 +1,12 @@
 package dns
 
 import (
-	"github.com/xtls/xray-core/common"
+	"context"
+	"strconv"
+
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/strmatcher"
-	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/dns"
 )
 
@@ -14,77 +16,40 @@ type StaticHosts struct {
 	matchers *strmatcher.MatcherGroup
 }
 
-var typeMap = map[DomainMatchingType]strmatcher.Type{
-	DomainMatchingType_Full:      strmatcher.Full,
-	DomainMatchingType_Subdomain: strmatcher.Domain,
-	DomainMatchingType_Keyword:   strmatcher.Substr,
-	DomainMatchingType_Regex:     strmatcher.Regex,
-}
-
-func toStrMatcher(t DomainMatchingType, domain string) (strmatcher.Matcher, error) {
-	strMType, f := typeMap[t]
-	if !f {
-		return nil, newError("unknown mapping type", t).AtWarning()
-	}
-	matcher, err := strMType.New(domain)
-	if err != nil {
-		return nil, newError("failed to create str matcher").Base(err)
-	}
-	return matcher, nil
-}
-
 // NewStaticHosts creates a new StaticHosts instance.
-func NewStaticHosts(hosts []*Config_HostMapping, legacy map[string]*net.IPOrDomain) (*StaticHosts, error) {
+func NewStaticHosts(hosts []*Config_HostMapping) (*StaticHosts, error) {
 	g := new(strmatcher.MatcherGroup)
 	sh := &StaticHosts{
-		ips:      make([][]net.Address, len(hosts)+len(legacy)+16),
+		ips:      make([][]net.Address, len(hosts)+16),
 		matchers: g,
-	}
-
-	if legacy != nil {
-		features.PrintDeprecatedFeatureWarning("simple host mapping")
-
-		for domain, ip := range legacy {
-			matcher, err := strmatcher.Full.New(domain)
-			common.Must(err)
-			id := g.Add(matcher)
-
-			address := ip.AsAddress()
-			if address.Family().IsDomain() {
-				return nil, newError("invalid domain address in static hosts: ", address.Domain()).AtWarning()
-			}
-
-			sh.ips[id] = []net.Address{address}
-		}
 	}
 
 	for _, mapping := range hosts {
 		matcher, err := toStrMatcher(mapping.Type, mapping.Domain)
 		if err != nil {
-			return nil, newError("failed to create domain matcher").Base(err)
+			return nil, errors.New("failed to create domain matcher").Base(err)
 		}
 		id := g.Add(matcher)
 		ips := make([]net.Address, 0, len(mapping.Ip)+1)
 		switch {
+		case len(mapping.ProxiedDomain) > 0:
+			if mapping.ProxiedDomain[0] == '#' {
+				rcode, err := strconv.Atoi(mapping.ProxiedDomain[1:])
+				if err != nil {
+					return nil, err
+				}
+				ips = append(ips, dns.RCodeError(rcode))
+			} else {
+				ips = append(ips, net.DomainAddress(mapping.ProxiedDomain))
+			}
 		case len(mapping.Ip) > 0:
 			for _, ip := range mapping.Ip {
 				addr := net.IPAddress(ip)
 				if addr == nil {
-					return nil, newError("invalid IP address in static hosts: ", ip).AtWarning()
+					return nil, errors.New("invalid IP address in static hosts: ", ip).AtWarning()
 				}
 				ips = append(ips, addr)
 			}
-
-		case len(mapping.ProxiedDomain) > 0:
-			ips = append(ips, net.DomainAddress(mapping.ProxiedDomain))
-
-		default:
-			return nil, newError("neither IP address nor proxied domain specified for domain: ", mapping.Domain).AtWarning()
-		}
-
-		// Special handling for localhost IPv6. This is a dirty workaround as JSON config supports only single IP mapping.
-		if len(ips) == 1 && ips[0] == net.LocalHostIP {
-			ips = append(ips, net.LocalHostIPv6)
 		}
 
 		sh.ips[id] = ips
@@ -100,24 +65,54 @@ func filterIP(ips []net.Address, option dns.IPOption) []net.Address {
 			filtered = append(filtered, ip)
 		}
 	}
-	if len(filtered) == 0 {
-		return nil
-	}
 	return filtered
 }
 
-// LookupIP returns IP address for the given domain, if exists in this StaticHosts.
-func (h *StaticHosts) LookupIP(domain string, option dns.IPOption) []net.Address {
-	indices := h.matchers.Match(domain)
-	if len(indices) == 0 {
-		return nil
-	}
-	ips := []net.Address{}
-	for _, id := range indices {
+func (h *StaticHosts) lookupInternal(domain string) ([]net.Address, error) {
+	ips := make([]net.Address, 0)
+	found := false
+	for _, id := range h.matchers.Match(domain) {
+		for _, v := range h.ips[id] {
+			if err, ok := v.(dns.RCodeError); ok {
+				if uint16(err) == 0 {
+					return nil, dns.ErrEmptyResponse
+				}
+				return nil, err
+			}
+		}
 		ips = append(ips, h.ips[id]...)
+		found = true
 	}
-	if len(ips) == 1 && ips[0].Family().IsDomain() {
-		return ips
+	if !found {
+		return nil, nil
 	}
-	return filterIP(ips, option)
+	return ips, nil
+}
+
+func (h *StaticHosts) lookup(domain string, option dns.IPOption, maxDepth int) ([]net.Address, error) {
+	switch addrs, err := h.lookupInternal(domain); {
+	case err != nil:
+		return nil, err
+	case len(addrs) == 0: // Not recorded in static hosts, return nil
+		return addrs, nil
+	case len(addrs) == 1 && addrs[0].Family().IsDomain(): // Try to unwrap domain
+		errors.LogDebug(context.Background(), "found replaced domain: ", domain, " -> ", addrs[0].Domain(), ". Try to unwrap it")
+		if maxDepth > 0 {
+			unwrapped, err := h.lookup(addrs[0].Domain(), option, maxDepth-1)
+			if err != nil {
+				return nil, err
+			}
+			if unwrapped != nil {
+				return unwrapped, nil
+			}
+		}
+		return addrs, nil
+	default: // IP record found, return a non-nil IP array
+		return filterIP(addrs, option), nil
+	}
+}
+
+// Lookup returns IP addresses or proxied domain for the given domain, if exists in this StaticHosts.
+func (h *StaticHosts) Lookup(domain string, option dns.IPOption) ([]net.Address, error) {
+	return h.lookup(domain, option, 5)
 }

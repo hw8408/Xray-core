@@ -15,14 +15,18 @@ func LineSeparator() string {
 }
 
 func GetToolLocation(file string) string {
-	const name = "xray.location.tool"
-	toolPath := EnvFlag{Name: name, AltName: NormalizeEnvName(name)}.GetValue(getExecutableDir)
+	toolPath := NewEnvFlag(ToolLocation).GetValue(getExecutableDir)
 	return filepath.Join(toolPath, file+".exe")
 }
 
-// GetAssetLocation search for `file` in the excutable dir
+// GetAssetLocation searches for `file` in the env dir and the executable dir
 func GetAssetLocation(file string) string {
-	const name = "xray.location.asset"
-	assetPath := NewEnvFlag(name).GetValue(getExecutableDir)
+	assetPath := NewEnvFlag(AssetLocation).GetValue(getExecutableDir)
 	return filepath.Join(assetPath, file)
+}
+
+// GetCertLocation searches for `file` in the env dir and the executable dir
+func GetCertLocation(file string) string {
+	certPath := NewEnvFlag(CertLocation).GetValue(getExecutableDir)
+	return filepath.Join(certPath, file)
 }

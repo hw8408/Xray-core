@@ -7,6 +7,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	. "github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 func TestFreedomConfig(t *testing.T) {
@@ -18,14 +19,12 @@ func TestFreedomConfig(t *testing.T) {
 		{
 			Input: `{
 				"domainStrategy": "AsIs",
-				"timeout": 10,
 				"redirect": "127.0.0.1:3366",
 				"userLevel": 1
 			}`,
 			Parser: loadJSON(creator),
 			Output: &freedom.Config{
-				DomainStrategy: freedom.Config_AS_IS,
-				Timeout:        10,
+				DomainStrategy: internet.DomainStrategy_AS_IS,
 				DestinationOverride: &freedom.DestinationOverride{
 					Server: &protocol.ServerEndpoint{
 						Address: &net.IPOrDomain{
